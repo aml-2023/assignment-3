@@ -14,113 +14,13 @@ from utils.data_utils import define_actions
 from utils.h36_3d_viz import visualize
 import time
 import pandas as pd
+from torch.autograd import Variable
 
 import torch.nn.functional as F
 
 import torch
 import torch.nn as nn
 from torch.nn.utils import weight_norm
-
-
-class EncoderBlock(nn.Module):
-
-    def __init__(self, input_dim, num_heads, dim_feedforward, dropout=0.0):
-        """
-        Inputs:
-            input_dim - Dimensionality of the input
-            num_heads - Number of heads to use in the attention block
-            dim_feedforward - Dimensionality of the hidden layer in the MLP
-            dropout - Dropout probability to use in the dropout layers
-        """
-        super().__init__()
-
-        # Attention layer
-        self.self_attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, device=device)
-
-        # Two-layer MLP
-        self.linear_net = nn.Sequential(
-            nn.Linear(input_dim, dim_feedforward, device=device),
-            nn.Dropout(dropout),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim_feedforward, input_dim, device=device)
-        )
-
-        # Layers to apply in between the main layers
-        self.norm1 = nn.LayerNorm(input_dim, device=device)
-        self.norm2 = nn.LayerNorm(input_dim, device=device)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, src, mask=None, src_key_padding_mask=None, is_causal=None):
-        # Self_attention part (use self.norm1)
-        multi_head_attn, _ = self.self_attn.forward(src, src, src, attn_mask=mask, need_weights=False)
-        multi_head_attn = self.dropout(multi_head_attn)
-        normed = self.norm1(src + multi_head_attn)
-
-        # MLP part (use self.norm2)
-        ffn_out = self.linear_net.forward(normed)
-        ffn_out = self.dropout(ffn_out)
-        normed = self.norm2(src + ffn_out)
-
-        x = normed
-
-        return x
-
-
-class DecoderBlock(nn.Module):
-
-    def __init__(self, input_dim, num_heads, dim_feedforward, dropout=0.0):
-        """
-        Inputs:
-            input_dim - Dimensionality of the input
-            num_heads - Number of heads to use in the attention block
-            dim_feedforward - Dimensionality of the hidden layer in the MLP
-            dropout - Dropout probability to use in the dropout layers
-        """
-        super().__init__()
-
-        # Self Attention layer
-        self.self_attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads)
-        # Attention Layer
-        self.src_attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads)
-
-        # Two-layer MLP
-        self.linear_net = nn.Sequential(
-            nn.Linear(input_dim, dim_feedforward),
-            nn.Dropout(dropout),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim_feedforward, input_dim)
-        )
-
-        # Layers to apply in between the main layers
-        self.norm1 = nn.LayerNorm(input_dim)
-        self.norm2 = nn.LayerNorm(input_dim)
-        self.norm3 = nn.LayerNorm(input_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
-                tgt_key_padding_mask=None,
-                memory_key_padding_mask=None,
-                tgt_is_causal=None, memory_is_causal=None):
-        # Self-Attention part (use self.norm1)
-
-        masked_attn, *_ = self.self_attn.forward(tgt, tgt, tgt, attn_mask=tgt_mask, need_weights=False)
-        masked_attn = self.dropout(masked_attn)
-        normed = self.norm1(tgt + masked_attn)
-
-        # Attention part (use self.norm2)
-        # Recall that memory is the output of the encoder and replaces x as
-        # the key and value in the attention layer
-
-        attn, *_ = self.src_attn.forward(normed, memory, memory, attn_mask=memory_mask, need_weights=False)
-        attn = self.dropout(attn)
-        normed = self.norm2(normed + attn)
-
-        # MLP part (use self.norm3)
-        linear_out = self.linear_net.forward(normed)
-        linear_out = self.dropout(linear_out)
-        x = self.norm3(normed + linear_out)
-
-        return x
 
 
 class Chomp1d(nn.Module):
@@ -262,6 +162,74 @@ def train_tcn_transformer(model, train_loader, val_loader, device, n_epochs, cli
             scheduler.step()
 
 
+class PositionalEncoding(nn.Module):
+    """
+    Implement the PE function.
+    """
+
+    def __init__(self, d_model, dropout, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, d_model)
+
+        # --------- start of our code
+
+        # all possible positions
+        positions = torch.arange(0, max_len, dtype=torch.float32, device=device).unsqueeze(1)
+
+        # getting the even dimensions
+        even_dims = torch.arange(0, d_model, 2, dtype=torch.float32, device=device)
+
+        # getting the odd dimensions
+        odd_dims = torch.arange(1, d_model, 2, dtype=torch.float32, device=device)
+
+        # calculating the denominators
+        sin_denominator = torch.pow(10000.0, even_dims / d_model)
+        cos_denominator = torch.pow(10000.0, (odd_dims - 1) / d_model)
+
+        # assigning the sin output to the even dimensions
+        pe[:, 0::2] = torch.sin(positions / sin_denominator)
+
+        # assigning the cos output to the odd dimensions
+        pe[:, 1::2] = torch.cos(positions / cos_denominator)
+
+        # ------- end of our code
+
+        pe = pe.unsqueeze(0)  # the final dimension is (1, max_len, d_model)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + Variable(self.pe[:, :x.size(1)], requires_grad=False)
+        return self.dropout(x)
+
+
+class CustomModel(nn.Module):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        d_model = 512
+        self.pos_enc = PositionalEncoding(d_model=d_model, dropout=0.1)
+
+        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, dim_feedforward=dim_feed_forward)
+        enc = nn.TransformerEncoder(enc_layer, num_layers=num_enc_layers)
+
+        # decoder is just a simple TCN, that takes in 10 channels (number of input frames) and predicts an output of 25
+        dec = TemporalConvNet(10, [25, 25, 25])
+
+        self.embed = nn.Linear(66, d_model, device=device)
+
+        self.tf = nn.Transformer(d_model=d_model, nhead=8, custom_encoder=enc, custom_decoder=dec, batch_first=True,
+                                 device=device)
+
+    def forward(self, src, target):
+        src_embed = self.embed.forward(src)
+        src_encoded = self.pos_enc.forward(src_embed)
+        target_encoded = self.pos_enc.forward(target)
+        return self.tf.forward(src_encoded, target_encoded)
+
+
 if __name__ == "__main__":
     # # Arguments to setup the datasets
     datas = 'h36m'  # dataset name
@@ -272,6 +240,9 @@ if __name__ == "__main__":
     skip_rate = 1  # # skip rate of frames
     joints_to_consider = 22
 
+    d_model = 512
+    dim_feed_forward = 2048
+    num_enc_layers = 6
     # FLAGS FOR THE TRAINING
     mode = 'train'  # choose either train or test mode
 
@@ -301,12 +272,5 @@ if __name__ == "__main__":
     print('>>> Validation dataset length: {:d}'.format(vald_dataset.__len__()))
     vald_loader = DataLoader(vald_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
-    enc = EncoderBlock(input_dim=66, num_heads=6, dim_feedforward=64, dropout=0.1)
-
-    # decoder is just a simple TCN, that takes in 10 channels (number of input frames) and predicts an output of 25
-    dec = TemporalConvNet(10, [25, 25, 25])
-
-    # num inputs is the number of frames, because these are my timesteps?
-    tf = nn.Transformer(d_model=66, nhead=6, custom_encoder=enc, custom_decoder=dec, batch_first=True, device=device)
-
-    train_tcn_transformer(tf, data_loader, vald_loader, device, 41)
+    model = CustomModel()
+    train_tcn_transformer(model, data_loader, vald_loader, device, 41)
